@@ -1,0 +1,120 @@
+# bizgo-sdk-comm (Python)
+
+> Python SDK for the Bizgo Communication API (Korea): SMS/LMS/MMS, international SMS, RCS, Kakao AlimTalk/BrandMessage, Naver TalkTalk. Install `pip install bizgo-sdk-comm`, import `bizgo`. Python >= 3.10.
+
+## Rules for generated code
+
+- Read the API key from the environment: `Bizgo()` uses `BIZGO_API_KEY`. Never hard-code keys, never put them in client-side code. The key is sent raw (no `Bearer`/`ApiKey` prefix); the SDK does this.
+- Use `Environment.SANDBOX` for tests (no real delivery). Default is PRODUCTION.
+- Every channel is sent with `client.send.omni(to=..., messages=[...])`. Put fallback channels after the primary one: `[AlimtalkMessage(...), SmsMessage(...)]`.
+- `from` is a Python keyword: use `from_=` on `SmsMessage`, `MmsMessage`, `InternationalMessage`, `client.send.sms/lms/mms`.
+- LMS and MMS both use `MmsMessage`; MMS when `file_key=[...]` is set (upload with `client.files.upload_mms` first, max 3 keys, jpg <= 300KB).
+- SMS text <= 90 bytes, LMS/MMS <= 2000 bytes, counted in EUC-KR (Hangul = 2 bytes). Emoji are rejected. Validation happens before sending and raises `pydantic.ValidationError`.
+- Max 200 recipients per request. For more, use `client.send.bulk(to=[...], messages=[...], idempotency_key_prefix=...)` (chunks of 200, keeps going on chunk failure; check `result.errors`, `result.failed` and `result.duplicates`).
+- Set `idempotency_key=` on sends that may be retried; without it, sends are not retried after timeouts (to avoid duplicates). With a key and no `idempotency_ttl`, the SDK sends `idempotencyTtl` = `bizgo.DEFAULT_IDEMPOTENCY_TTL` (86400 s; Bizgo rejects a key without a TTL with A309). An explicit TTL (0-86400, including 0) is kept; no key means no TTL. The same applies to `send.bulk` chunks and generated operations whose body has `idempotencyKey` (model or dict).
+- A successful send only means *accepted*. Check `result.failed` for rejected recipients (`result.duplicates` = recipients already accepted with the same idempotency key, per-recipient A301: not rejected, not sent again, not in `succeeded`; a request-level A301 raises `DuplicateRequestError`), and get final delivery results from reports (`client.reports.consume(handler)` or webhooks).
+- Substitution: text contains `#{name}`; values go in `Destination(to=..., replace_words={"name": "..."})`.
+- Alimtalk full send (no `send_type`, or not `"template"`) needs `msg_type="AT"` (text) or `"AI"` (image) and `text` (the server rejects a missing msgType with A523). Reuse the template's type: `client.alimtalk.templates.get(sender_key=..., template_code=...).msg_type`. With `send_type="template"` (alimtalk / brand message) leave `msg_type`/`text` out and give every destination `replace_words`.
+- Conditional-required fields from the spec (`x-sdk-required-if`: alimtalk/brand message `send_type`, brand button `WL` needs `url_pc`+`url_mobile`, RCS `header="1"` needs `footer`, counsel message attachments) are checked before sending, for models and dict bodies, and raise `pydantic.ValidationError` (paths and conditions only, no values).
+- Request models reject unknown fields. Use the documented field names (snake_case or the API camelCase).
+- Every other API operation is a generated method `client.<resource>.<method>(path_params..., body, *, query=...)` in snake_case (see the table below). Bodies accept the model or a dict with API field names; list operations with pagination also have `iter_<method>(...)`.
+- Rate limiting is on by default per client (buckets start full): send bucket = 200 messages/second (수신번호 기준) counted per recipient (a 200-recipient send costs 200 tokens), other APIs 5 requests/second. It is per process only; several workers sharing one key must split the limit (`rate_limit=RateLimit(send=..., other=...)`, or `rate_limit=None`).
+- For tests use `bizgo.testing.FakeTransport` (`fake.client()`), never a real key or real phone numbers.
+- Use `Bizgo(proxy=..., verify='/path/ca.pem')` instead of a custom `http_client`. A custom `http_client` must use the stock transport (retries=0), no event hooks, no cookies; otherwise it is refused unless `trust_http_client=True` (you guarantee no redirects/retries/auth). `verify=False` is refused.
+- Method results are never `None` for a success (empty object / `[]` when the response has no data); only void operations return `None`. Response model *fields* are Optional: check for `None` (code must pass `mypy --strict`). Model constructors type-check with Python field names (`sender_key=`, `from_=`), with or without the pydantic mypy plugin.
+- `pydantic.ValidationError` only comes from request validation *before sending*. Unreadable responses raise `bizgo.InvalidResponseError` (a send may have been accepted: check status). `DuplicateRequestError.already_accepted` is True when an earlier attempt of the same call was accepted.
+- `send.bulk` idempotency keys are `<prefix>-<chunk_size>-<start>-<hash8>`: re-run with the same list and chunk_size only.
+- Report/MO webhooks: `receiver.report(headers, body)` / `receiver.mo(...)` verify `X-IB-Signature` = HMAC-SHA256(secret, `X-IB-Timestamp`) (hex or base64). The webhook secret is obtained by requesting it from Bizgo; read it from an env var or secret store.
+- Counsel (상담톡) webhooks: `receiver.counsel_message(headers, body)` etc.; answer with `receiver.counsel_ack()` (`{"code": "A000", "result": "Success"}`). Counsel webhooks are not signed (signatures apply only to report/MO): the SDK does not check signature headers (ignored if present) but still enforces the 1 MB body cap, JSON depth 64 and type checks. No secret needed: use `bizgo.webhooks.parse_counsel_message(body)` etc. and `bizgo.webhooks.counsel_ack()`. Report/MO webhooks always need a signature.
+- Never log request/response bodies, webhook bodies or phone numbers. Hooks (`bizgo.hooks.Hooks`) and `bizgo.otel.OpenTelemetryHooks` only see operation, path template, status and error codes.
+
+## Quick reference
+
+```python
+import os
+
+from bizgo import Bizgo, Destination, Environment, RateLimit, SmsMessage
+from bizgo.models import Report
+
+client = Bizgo(environment=Environment.SANDBOX)  # key from BIZGO_API_KEY
+
+result = client.send.sms(to="01000000000", from_="01000000000", text="hello")  # SendResult
+print(result.msg_keys, result.failed)
+client.send.lms(to="01000000000", from_="01000000000", text="long text", title="title")
+client.send.omni(
+    to=[Destination(to="01000000000", replace_words={"name": "Hong"})],
+    messages=[SmsMessage(from_="01000000000", text="#{name}")],
+    idempotency_key="order-1",
+)
+uploaded = client.files.upload_mms(b"<jpg bytes>", filename="a.jpg")  # .file_key is Optional[str]
+if uploaded.file_key is not None:
+    client.send.mms(to="01000000000", from_="01000000000", text="x", file_keys=[uploaded.file_key])
+bulk = client.send.bulk(to=["01000000000"], messages=[SmsMessage(from_="01000000000", text="x")])
+print(bulk.msg_keys, bulk.errors, bulk.failed, bulk.duplicates)  # BulkSendResult
+
+
+def handle(reports: list[Report]) -> None:
+    for report in reports:
+        print(report.msg_key, report.report_code)
+
+
+client.reports.consume(handle)  # polls, calls handle, acks each batch
+statuses = client.messages.status("MSG_KEY_EXAMPLE")  # list[MessageStatus]
+
+# generated from the spec: client.<resource>.<method>(path params, body, *, query) - same on AsyncBizgo
+templates = client.alimtalk.templates.list(sender_key="SENDER_KEY_EXAMPLE")  # list[AlimtalkTemplate]
+reservation = client.reservations.create(
+    {
+        "destinations": [{"to": "01000000000"}],
+        "messageFlow": [{"sms": {"from": "01000000000", "text": "x"}}],
+        "resvSendTime": "2026-10-01 10:00:00",
+    }
+)
+if reservation.resv_key:  # results are never None (empty object if no data); fields are Optional
+    client.reservations.cancel(reservation.resv_key)
+
+Bizgo(rate_limit=RateLimit(send=200, other=5), app_info=("myshop", "1.4.2"))
+
+from bizgo.webhooks import WebhookReceiver, WebhookVerificationError  # noqa: E402
+
+receiver = WebhookReceiver(secret=os.environ.get("BIZGO_WEBHOOK_SECRET", "test-webhook-secret"))
+
+
+def report_webhook(headers: dict[str, str], raw_body: bytes) -> tuple[int, dict[str, str]]:
+    try:
+        report = receiver.report(headers, raw_body)
+    except WebhookVerificationError:  # includes WebhookPayloadError (bad body): answer 4xx
+        return 401, {}
+    return 200, receiver.ack(report.msg_key)  # {"msgKey": ...} within 5 seconds; dedupe by msg_key
+```
+
+Other generated resources (same call rules): `client.reservations.recipients`, `client.kakao.senders/categories/groups/sanctions`,
+`client.alimtalk.templates/template_categories/public_templates`, `client.insights.alimtalk/brand_message/rcs`,
+`client.brand_message.group_sends/templates/friend_groups/group_tags/videos/audience/permissions/marketing_agreements/unsubscribe_contents`,
+`client.rcs.brands/chatbots/templates/template_forms/common_formats/template_images`,
+`client.counsel.messages/sessions/users/certs/files/channels/consult_time/system_messages`. Paginated lists also have
+`iter_<method>(...)`. Multipart uploads take `file` as a path, bytes or a binary file object.
+
+Tests: `from bizgo.testing import FakeTransport, sign_webhook`; `fake = FakeTransport(); client = fake.client()`;
+`fake.on("sendOmni").send_result("A000", "A306")`, `fake.on("getReportInquiry").fail("gateway", 401, "A401")`,
+`fake.last_request.operation_id`, `fake.last_request.json`; `headers, body = sign_webhook(secret, payload)`.
+
+Async: `async with AsyncBizgo() as client: await client.send.omni(...)`; iterators are `async for`.
+
+## SDK identification
+
+Every request carries `User-Agent: bizgo-sdk-comm-python/<ver> python/<ver> (<os>; <arch>)[ app/<name>-<version>]` and `X-Bizgo-Client: bizgo-sdk-comm-python/<ver>`. Nothing else is collected. `app_info=(name, version)` must match `[A-Za-z0-9._-]{1,50}` / `[A-Za-z0-9._+-]{1,30}` (no personal data).
+
+## Errors
+
+`bizgo.BizgoError` > `ConfigurationError`, `APIConnectionError` (> `APITimeoutError`), `APIError` (> `BadRequestError`, `AuthenticationError`, `PermissionDeniedError`, `NotFoundError`, `DuplicateRequestError`, `RateLimitError`, `InternalServerError`), `InvalidResponseError`, `WebhookVerificationError`.
+`APIError` has `http_status`, `code`, `layer` ("gateway" = common.authCode, "service" = data.code; same code differs by layer), `description` (Korean), `tracking_id`.
+`AuthenticationError` usually means a wrong key or an unregistered caller IP.
+
+## Links
+
+- [README](https://github.com/icomm-api/bizgo-sdk-comm-python/blob/main/README.md)
+- [Examples](https://github.com/icomm-api/bizgo-sdk-comm-python/tree/main/examples)
+- [OpenAPI spec](https://github.com/icomm-api/bizgo-api-spec/blob/main/dist/openapi.yaml)
+- [Bizgo API reference](https://developers.bizgo.io/api-sdk/api-reference)
+- [Error codes](https://developers.bizgo.io/api-sdk/api-reference/error-codes)
