@@ -40,7 +40,7 @@ dev = [
   "pytest-asyncio>=0.23",
   "respx>=0.21",
   "mypy>=1.10",
-  "ruff==0.16.8",  # pinned: scripts/_gen_resources.py formats generated code with it (--check must be reproducible)
+  "ruff==0.17.1",  # pinned: scripts/_gen_resources.py formats generated code with it (--check must be reproducible)
   "pyyaml>=6",
   "datamodel-code-generator==0.82.0",
 ]
