@@ -42,7 +42,7 @@ dev = [
   "mypy>=1.10",
   "ruff==0.16.8",  # pinned: scripts/_gen_resources.py formats generated code with it (--check must be reproducible)
   "pyyaml>=6",
-  "datamodel-code-generator==0.82.0",
+  "datamodel-code-generator==0.86.0",
 ]
 
 [project.urls]
